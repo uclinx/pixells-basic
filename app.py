@@ -175,7 +175,8 @@ if not API_KEY:
 
 HMAC_SECRET = setting("HMAC_SECRET")
 if not HMAC_SECRET:
-    raise RuntimeError("HMAC_SECRET must be configured for secure access.")
+    logger.warning("HMAC_SECRET missing; defaulting to API_KEY. Set HMAC_SECRET for stronger security.")
+    HMAC_SECRET = API_KEY
 HMAC_SECRET_BYTES = HMAC_SECRET.encode()
 
 TIMESTAMP_HEADER = "X-TIMESTAMP"
