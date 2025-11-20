@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -6,13 +8,14 @@ import re
 import time
 from collections import deque
 from contextlib import suppress
-from queue import Empty, Queue
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import requests
+import aiohttp
+import orjson
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import ORJSONResponse, Response
 from pydantic import BaseModel, validator
+from redis.asyncio import Redis
 
 
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", "app_settings.json")
@@ -113,79 +116,53 @@ class JobPayload(BaseModel):
         return numeric
 
 
-class JobQueueManager:
-    def __init__(self, redis_url: Optional[str]) -> None:
-        self._queue: Queue = Queue()
-        self._redis = None
-        self._redis_key = "roblox_job_queue"
-        if redis_url:
-            try:
-                import redis  # type: ignore
-
-                self._redis = redis.from_url(redis_url, decode_responses=True)
-                logger.info("redis queue backend enabled")
-            except Exception as exc:  # pragma: no cover
-                logger.warning("redis unavailable, using in-memory queue: %s", exc)
-        else:
-            logger.info("in-memory queue backend enabled")
-
-    async def enqueue(self, job: Dict[str, Any]) -> None:
-        if self._redis:
-            payload = json.dumps(job, separators=(",", ":"))
-            await asyncio.to_thread(self._redis.lpush, self._redis_key, payload)
-        else:
-            self._queue.put(job)
+class LatestJobStore:
+    def __init__(self, redis_client: Optional[Redis], redis_key: str) -> None:
+        self._redis = redis_client
+        self._redis_key = redis_key
+        self._lock = asyncio.Lock()
+        self._latest: Optional[Dict[str, Any]] = None
 
     async def set_latest(self, job: Dict[str, Any]) -> None:
         if self._redis:
-            payload = json.dumps(job, separators=(",", ":"))
-            await asyncio.to_thread(self._set_latest_redis, payload)
-        else:
-            await asyncio.to_thread(self._set_latest_memory, job)
-
-    def _set_latest_memory(self, job: Dict[str, Any]) -> None:
-        while True:
-            try:
-                self._queue.get_nowait()
-            except Empty:
-                break
-        self._queue.put(job)
-
-    def _set_latest_redis(self, payload: str) -> None:
-        if not self._redis:
+            payload = orjson.dumps(job).decode()
+            pipe = self._redis.pipeline(transaction=False)
+            await pipe.delete(self._redis_key)
+            await pipe.lpush(self._redis_key, payload)
+            await pipe.execute()
             return
-        pipe = self._redis.pipeline(transaction=False)
-        pipe.delete(self._redis_key)
-        pipe.lpush(self._redis_key, payload)
-        pipe.execute()
 
-    async def dequeue(self) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            self._latest = job.copy()
+
+    async def pop_latest(self) -> Optional[Dict[str, Any]]:
         if self._redis:
-            raw = await asyncio.to_thread(self._redis.rpop, self._redis_key)
-            if raw:
-                try:
-                    return json.loads(raw)
-                except json.JSONDecodeError:  # pragma: no cover
-                    logger.warning("discarded malformed job payload from redis")
-                    return None
-            return None
-        try:
-            return self._queue.get_nowait()
-        except Empty:
-            return None
+            raw = await self._redis.rpop(self._redis_key)
+            if raw is None:
+                return None
+            try:
+                return orjson.loads(raw)
+            except orjson.JSONDecodeError:  # pragma: no cover
+                logger.warning("discarded malformed job payload from redis")
+                return None
+
+        async with self._lock:
+            job = self._latest
+            self._latest = None
+            return job
 
 
-queue_manager = JobQueueManager(REDIS_URL)
+redis_client: Optional[Redis] = None
+job_store = LatestJobStore(None, "roblox_job_queue")
 connected_clients: Set[WebSocket] = set()
 clients_lock = asyncio.Lock()
 broadcast_lock = asyncio.Lock()
 recent_job_ids: deque[str] = deque(maxlen=RECENT_JOB_IDS_LIMIT)
 recent_ids_lock = asyncio.Lock()
-api_session = requests.Session()
-api_session.headers.update({
-    "Content-Type": "application/json",
-    "Connection": "keep-alive",
-})
+
+INTERNAL_REQUEST_HEADER = "X-Internal-Request"
+local_rate_limits: Dict[str, Tuple[int, float]] = {}
+local_rate_lock = asyncio.Lock()
 
 default_discord_headers = {
     "User-Agent": "RobloxJobGateway/1.0",
@@ -196,10 +173,21 @@ if DISCORD_TOKEN:
 if not API_KEY:
     raise RuntimeError("API_KEY must be configured for secure access.")
 
+HMAC_SECRET = setting("HMAC_SECRET")
+if not HMAC_SECRET:
+    raise RuntimeError("HMAC_SECRET must be configured for secure access.")
+HMAC_SECRET_BYTES = HMAC_SECRET.encode()
+
+TIMESTAMP_HEADER = "X-TIMESTAMP"
+SIGNATURE_HEADER = "X-SIGNATURE"
+TIMESTAMP_TOLERANCE = int(setting("TIMESTAMP_TOLERANCE", "60"))
+RATE_LIMIT_PER_MINUTE = int(setting("RATE_LIMIT_PER_MINUTE", "40"))
+RATE_LIMIT_WINDOW_SECONDS = int(setting("RATE_LIMIT_WINDOW_SECONDS", "60"))
+
 app = FastAPI(title="Roblox Job Gateway", docs_url=None, redoc_url=None)
 
-discord_session = requests.Session()
-discord_session.headers.update(default_discord_headers)
+discord_session: Optional[aiohttp.ClientSession] = None
+internal_session: Optional[aiohttp.ClientSession] = None
 discord_task: Optional[asyncio.Task] = None
 
 
@@ -213,12 +201,79 @@ async def remember_job(job_id: str) -> bool:
         return True
 
 
+def verify_signature(timestamp: str, signature: str) -> None:
+    try:
+        ts_value = int(timestamp)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid timestamp") from exc
+
+    now = int(time.time())
+    if abs(now - ts_value) > TIMESTAMP_TOLERANCE:
+        raise HTTPException(status_code=400, detail="Timestamp outside tolerance")
+
+    expected = hmac.new(HMAC_SECRET_BYTES, timestamp.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+
+def _client_identifier(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    if request.headers.get(INTERNAL_REQUEST_HEADER) == "1":
+        return await call_next(request)
+
+    identifier = _client_identifier(request)
+
+    if redis_client is not None:
+        key = f"rate:{identifier}"
+        try:
+            count = await redis_client.incr(key)
+            if count == 1:
+                await redis_client.expire(key, RATE_LIMIT_WINDOW_SECONDS)
+            if count > RATE_LIMIT_PER_MINUTE:
+                ttl = await redis_client.ttl(key)
+                retry_after = ttl if ttl and ttl > 0 else RATE_LIMIT_WINDOW_SECONDS
+                return ORJSONResponse(
+                    {"detail": "Too many requests"},
+                    status_code=429,
+                    headers={"Retry-After": str(retry_after)},
+                )
+            return await call_next(request)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("redis rate limit fallback: %s", exc)
+
+    async with local_rate_lock:
+        now = time.time()
+        count, reset = local_rate_limits.get(identifier, (0, now + RATE_LIMIT_WINDOW_SECONDS))
+        if now >= reset:
+            local_rate_limits[identifier] = (1, now + RATE_LIMIT_WINDOW_SECONDS)
+        else:
+            if count + 1 > RATE_LIMIT_PER_MINUTE:
+                retry_after = int(max(1, reset - now))
+                return ORJSONResponse(
+                    {"detail": "Too many requests"},
+                    status_code=429,
+                    headers={"Retry-After": str(retry_after)},
+                )
+            local_rate_limits[identifier] = (count + 1, reset)
+
+    return await call_next(request)
+
+
 async def broadcast_job(job: Dict[str, Any]) -> None:
     async with clients_lock:
         clients_snapshot = list(connected_clients)
     if not clients_snapshot:
         return
-    payload = json.dumps(job, separators=(",", ":"))
+    payload = orjson.dumps(job).decode()
     async with broadcast_lock:
         stale: List[WebSocket] = []
         for websocket in clients_snapshot:
@@ -237,42 +292,47 @@ async def enqueue_job(job_obj: Dict[str, Any]) -> bool:
     is_new = await remember_job(str(job_id))
     if not is_new:
         return False
-    await queue_manager.set_latest(job_obj)
+    await job_store.set_latest(job_obj)
     logger.info("job enqueued")
     asyncio.create_task(broadcast_job(job_obj))
     return True
 
 
 async def dequeue_job() -> Optional[Dict[str, Any]]:
-    return await queue_manager.dequeue()
+    return await job_store.pop_latest()
 
 
-async def verify_api_key(request: Request) -> None:
+async def authenticate_request(request: Request) -> None:
     if not API_KEY:
         return
     provided = request.headers.get(API_KEY_HEADER)
     if provided != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    timestamp = request.headers.get(TIMESTAMP_HEADER)
+    signature = request.headers.get(SIGNATURE_HEADER)
+    if not timestamp or not signature:
+        raise HTTPException(status_code=400, detail="Missing signature headers")
+    verify_signature(timestamp, signature)
 
 
-@app.get("/health", dependencies=[Depends(verify_api_key)])
+@app.get("/health", dependencies=[Depends(authenticate_request)])
 async def health() -> Dict[str, bool]:
     return {"ok": True}
 
 
-@app.post("/job", dependencies=[Depends(verify_api_key)])
+@app.post("/job", dependencies=[Depends(authenticate_request)])
 async def add_job(payload: JobPayload) -> Dict[str, bool]:
     job_data = payload.dict()
     await enqueue_job(job_data)
     return {"ok": True}
 
 
-@app.get("/job/next", dependencies=[Depends(verify_api_key)])
+@app.get("/job/next", dependencies=[Depends(authenticate_request)])
 async def get_next_job() -> Response:
     job = await dequeue_job()
     if job is None:
         return Response(status_code=204)
-    return JSONResponse(job)
+    return ORJSONResponse(job)
 
 
 @app.websocket("/ws")
@@ -284,6 +344,24 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     if credential != API_KEY:
         await websocket.close(code=1008)
         logger.warning("websocket rejected due to invalid API key")
+        return
+    timestamp = (
+        websocket.headers.get(TIMESTAMP_HEADER)
+        or websocket.query_params.get("ts")
+    )
+    signature = (
+        websocket.headers.get(SIGNATURE_HEADER)
+        or websocket.query_params.get("sig")
+    )
+    if not timestamp or not signature:
+        await websocket.close(code=1008)
+        logger.warning("websocket rejected due to missing signature")
+        return
+    try:
+        verify_signature(timestamp, signature)
+    except HTTPException:
+        await websocket.close(code=1008)
+        logger.warning("websocket rejected due to invalid signature")
         return
     await websocket.accept()
     logger.info("websocket client connected")
@@ -300,19 +378,28 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
 
 async def post_job_non_blocking(job: Dict[str, Any]) -> None:
-    if not job:
+    if not job or internal_session is None:
         return
     base = SERVICE_BASE_URL.rstrip("/")
     url = f"{base}/job"
+    headers = {
+        API_KEY_HEADER: API_KEY,
+        TIMESTAMP_HEADER: str(int(time.time())),
+    }
+    headers[SIGNATURE_HEADER] = hmac.new(
+        HMAC_SECRET_BYTES,
+        headers[TIMESTAMP_HEADER].encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    headers[INTERNAL_REQUEST_HEADER] = "1"
 
-    def _do_post() -> None:
-        try:
-            headers = {API_KEY_HEADER: API_KEY} if API_KEY else {}
-            api_session.post(url, json=job, timeout=REQUEST_TIMEOUT, headers=headers)
-        except Exception as exc:  # pragma: no cover
-            logger.debug("internal job post failed: %s", exc)
-
-    await asyncio.to_thread(_do_post)
+    try:
+        async with internal_session.post(url, json=job, timeout=REQUEST_TIMEOUT, headers=headers) as response:
+            if response.status >= 400:
+                text = await response.text()
+                logger.debug("internal job post failed: %s %s", response.status, text)
+    except Exception as exc:  # pragma: no cover
+        logger.debug("internal job post exception: %s", exc)
 
 
 _money_pattern = re.compile(r"(\d+[\d,]*\.?\d*)")
@@ -356,48 +443,45 @@ def extract_jobs_from_message(message: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 async def discord_monitor() -> None:
-    if not CHANNEL_ID or not DISCORD_TOKEN:
+    if not CHANNEL_ID or not DISCORD_TOKEN or not discord_session:
         logger.info("discord monitor disabled (missing CHANNEL_ID or DISCORD_TOKEN)")
         return
 
     url = f"{DISCORD_API_BASE}/channels/{CHANNEL_ID}/messages"
     last_seen: Optional[str] = None
     logger.info("discord monitor started")
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT[1])
     try:
         while True:
             params: Dict[str, Any] = {"limit": 50}
             if last_seen:
                 params["after"] = last_seen
-
-            def _poll() -> requests.Response:
-                return discord_session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-
             try:
-                response = await asyncio.to_thread(_poll)
+                async with discord_session.get(url, params=params, timeout=timeout) as response:
+                    if response.status == 429:
+                        retry_after = DISCORD_POLL_SECONDS
+                        try:
+                            payload = await response.json()
+                            retry_after = float(payload.get("retry_after", retry_after))
+                        except Exception:  # pragma: no cover
+                            pass
+                        await asyncio.sleep(max(retry_after, DISCORD_POLL_SECONDS))
+                        continue
+
+                    if response.status >= 400:
+                        text = await response.text()
+                        logger.warning("discord poll error %s: %s", response.status, text)
+                        await asyncio.sleep(DISCORD_POLL_SECONDS)
+                        continue
+
+                    try:
+                        payload = await response.json()
+                    except Exception as exc:  # pragma: no cover
+                        logger.debug("discord poll json decode error: %s", exc)
+                        await asyncio.sleep(DISCORD_POLL_SECONDS)
+                        continue
             except Exception as exc:  # pragma: no cover
                 logger.debug("discord poll failed: %s", exc)
-                await asyncio.sleep(DISCORD_POLL_SECONDS)
-                continue
-
-            if response.status_code == 429:
-                retry_after = DISCORD_POLL_SECONDS
-                try:
-                    data = response.json()
-                    retry_after = float(data.get("retry_after", retry_after))
-                except Exception:  # pragma: no cover
-                    pass
-                await asyncio.sleep(max(retry_after, DISCORD_POLL_SECONDS))
-                continue
-
-            if response.status_code >= 400:
-                logger.warning("discord poll error %s: %s", response.status_code, response.text)
-                await asyncio.sleep(DISCORD_POLL_SECONDS)
-                continue
-
-            try:
-                payload = response.json()
-            except Exception as exc:  # pragma: no cover
-                logger.debug("discord poll json decode error: %s", exc)
                 await asyncio.sleep(DISCORD_POLL_SECONDS)
                 continue
 
@@ -432,8 +516,22 @@ async def discord_monitor() -> None:
 async def on_startup() -> None:
     global discord_task
     logger.info("api server started")
-    if HEADLESS_MODE:
-        logger.info("headless mode: %s", HEADLESS_MODE)
+    global redis_client, job_store, discord_session, internal_session
+    if REDIS_URL:
+        try:
+            redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
+            job_store = LatestJobStore(redis_client, "roblox_job_queue")
+            logger.info("redis queue backend enabled")
+        except Exception as exc:  # pragma: no cover
+            logger.warning("failed to init redis, falling back to memory: %s", exc)
+            redis_client = None
+            job_store = LatestJobStore(None, "roblox_job_queue")
+    else:
+        logger.info("in-memory queue backend enabled")
+
+    discord_session = aiohttp.ClientSession(headers=default_discord_headers)
+    internal_session = aiohttp.ClientSession()
+
     if CHANNEL_ID and DISCORD_TOKEN:
         discord_task = asyncio.create_task(discord_monitor())
     else:
@@ -448,8 +546,15 @@ async def on_shutdown() -> None:
         with suppress(asyncio.CancelledError):  # pragma: no cover
             await discord_task
         discord_task = None
-    discord_session.close()
-    api_session.close()
+    if discord_session:
+        await discord_session.close()
+    if internal_session:
+        await internal_session.close()
+    if redis_client:
+        try:
+            await redis_client.close()
+        except Exception:  # pragma: no cover
+            pass
 
 
 if __name__ == "__main__":  # pragma: no cover
