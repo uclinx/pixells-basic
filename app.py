@@ -136,6 +136,29 @@ class JobQueueManager:
         else:
             self._queue.put(job)
 
+    async def set_latest(self, job: Dict[str, Any]) -> None:
+        if self._redis:
+            payload = json.dumps(job, separators=(",", ":"))
+            await asyncio.to_thread(self._set_latest_redis, payload)
+        else:
+            await asyncio.to_thread(self._set_latest_memory, job)
+
+    def _set_latest_memory(self, job: Dict[str, Any]) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except Empty:
+                break
+        self._queue.put(job)
+
+    def _set_latest_redis(self, payload: str) -> None:
+        if not self._redis:
+            return
+        pipe = self._redis.pipeline(transaction=False)
+        pipe.delete(self._redis_key)
+        pipe.lpush(self._redis_key, payload)
+        pipe.execute()
+
     async def dequeue(self) -> Optional[Dict[str, Any]]:
         if self._redis:
             raw = await asyncio.to_thread(self._redis.rpop, self._redis_key)
@@ -214,7 +237,7 @@ async def enqueue_job(job_obj: Dict[str, Any]) -> bool:
     is_new = await remember_job(str(job_id))
     if not is_new:
         return False
-    await queue_manager.enqueue(job_obj)
+    await queue_manager.set_latest(job_obj)
     logger.info("job enqueued")
     asyncio.create_task(broadcast_job(job_obj))
     return True
@@ -379,28 +402,26 @@ async def discord_monitor() -> None:
                 continue
 
             if not isinstance(payload, list) or not payload:
-                await asyncio.sleep(DISCORD_POLL_SECONDS)
+                await asyncio.sleep(0)
                 continue
 
             try:
-                payload.sort(key=lambda item: int(item.get("id", "0")))
-            except Exception:  # pragma: no cover
-                pass
+                newest = max(payload, key=lambda item: int(item.get("id", "0")))
+            except Exception:
+                newest = payload[-1]
 
-            burst_mode = False
-            for message in payload:
-                message_id = message.get("id")
-                if message_id:
-                    last_seen = message_id
-                jobs = extract_jobs_from_message(message)
-                if jobs:
-                    burst_mode = True
-                for job in jobs:
-                    enqueue_success = await enqueue_job(job)
-                    if enqueue_success:
-                        asyncio.create_task(post_job_non_blocking(job))
+            message_id = newest.get("id")
+            if message_id:
+                last_seen = message_id
 
-            await asyncio.sleep(BURST_POLL_SECONDS if burst_mode else DISCORD_POLL_SECONDS)
+            jobs = extract_jobs_from_message(newest)
+            if jobs:
+                latest_job = jobs[-1]
+                enqueue_success = await enqueue_job(latest_job)
+                if enqueue_success:
+                    asyncio.create_task(post_job_non_blocking(latest_job))
+
+            await asyncio.sleep(0)
     except asyncio.CancelledError:  # pragma: no cover
         raise
     finally:
