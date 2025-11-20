@@ -23,10 +23,14 @@ pip install -r requirements.txt
 | `CHANNEL_ID` | Discord channel ID to poll | – |
 | `DISCORD_TOKEN` | Discord user token for REST polling | – |
 | `API_KEY` | **Required.** Shared secret; required on every HTTP/WebSocket call | – |
+| `HMAC_SECRET` | **Required.** Secret used to sign `X-TIMESTAMP` with HMAC-SHA256 | – |
 | `REDIS_URL` | Redis URL; enables Redis-backed FIFO queue | – |
 | `PORT` | HTTP listen port | `8000` |
 | `HEADLESS_MODE` | Set to `true`/`false` to signal headless mode | `true` |
 | `SERVICE_BASE_URL` | Self-referential base URL for internal callbacks | `https://pixells-basic.onrender.com` |
+| `TIMESTAMP_TOLERANCE` | Max seconds skew allowed when verifying signed requests | `60` |
+| `RATE_LIMIT_PER_MINUTE` | Requests allowed per client within window (set `0` to disable) | `0` |
+| `RATE_LIMIT_WINDOW_SECONDS` | Window size used for rate limiting | `60` |
 | `DISCORD_POLL_SECONDS` | Base poll interval (seconds) | `0.25` |
 | `BURST_POLL_SECONDS` | Burst interval when new jobs detected | `0.05` |
 
@@ -35,19 +39,28 @@ pip install -r requirements.txt
 ## Running Locally
 
 
-Launch with the API key exported (example PowerShell):
+Launch with the secrets exported (example PowerShell):
 
 ```powershell
 $env:API_KEY = 'super-secret-value'
+$env:HMAC_SECRET = 'another-secret'
 uvicorn app:app --host 0.0.0.0 --port $PORT
 ```
 
-This exposes:
+Every request must provide:
+
+1. `X-API-KEY: <API_KEY>`
+2. `X-TIMESTAMP: <unix seconds>` (must be within `TIMESTAMP_TOLERANCE` of server time)
+3. `X-SIGNATURE: HMAC_SHA256(HMAC_SECRET, X-TIMESTAMP)`
+
+Endpoints:
 
 - `POST /job` – Enqueue a job (requires `X-API-KEY`).
 - `GET /job/next` – Dequeue the next job (`X-API-KEY` required).
 - `GET /health` – Returns `{ "ok": true }` (`X-API-KEY` required).
 - `WS /ws` – WebSocket channel pushing jobs to connected Roblox clients (`X-API-KEY` header or `?api_key=` query required).
+
+Rate limiting is enforced per client (IP / `X-Forwarded-For`) via Redis; without Redis a local in-process bucket is used. Set `RATE_LIMIT_PER_MINUTE=0` (default) to disable throttling altogether.
 
 The service also runs a background Discord poller that parses embed fields into jobs, enqueues them, and mirrors them through the HTTP and WebSocket interfaces.
 
@@ -58,3 +71,28 @@ The service also runs a background Discord poller that parses embed fields into 
 3. Run command: `uvicorn app:app --host 0.0.0.0 --port $PORT`.
 4. Configure environment variables listed above (ensure `DISCORD_TOKEN`, `CHANNEL_ID`, `API_KEY`, and optionally `SERVICE_BASE_URL=https://pixells-basic.onrender.com`).
 5. When scaling to multiple instances, configure `REDIS_URL` so all replicas share the Redis-backed queue. Without Redis, run exactly one instance.
+6. Recommended start command (multi-core):
+
+   ```bash
+   gunicorn app:app -k uvicorn.workers.UvicornWorker -w $((2*CPU_CORES)) -b 0.0.0.0:$PORT
+   ```
+
+7. Ensure HTTPS is used (Render terminates TLS for you).
+
+## Reference Client (worker)
+
+`main.py` polls `/job/next` concurrently using `aiohttp`, automatically signing each request. Environment variables:
+
+- `BASE_URL` (default `https://pixells-basic.onrender.com`)
+- `API_KEY` – must match the server
+- `HMAC_SECRET` – same as server
+- `CONCURRENCY`, `TIMEOUT`, `INITIAL_BACKOFF`, `MAX_BACKOFF`, `RETRIES` – optional tuning knobs
+
+Run with:
+
+```powershell
+$env:BASE_URL = 'https://pixells-basic.onrender.com'
+$env:API_KEY = 'super-secret-value'
+$env:HMAC_SECRET = 'another-secret'
+python main.py
+```
