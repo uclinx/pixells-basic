@@ -493,18 +493,23 @@ async def discord_monitor() -> None:
                 await asyncio.sleep(0)
                 continue
 
-            try:
-                newest = max(payload, key=lambda item: int(item.get("id", "0")))
-            except Exception:
-                newest = payload[-1]
+            latest_job: Optional[Dict[str, Any]] = None
+            sorted_messages = sorted(
+                payload,
+                key=lambda item: int(item.get("id", "0")),
+            )
 
-            message_id = newest.get("id")
-            if message_id:
-                last_seen = message_id
+            for message in sorted_messages:
+                jobs = extract_jobs_from_message(message)
+                if jobs:
+                    latest_job = jobs[-1]
 
-            jobs = extract_jobs_from_message(newest)
-            if jobs:
-                latest_job = jobs[-1]
+            last_message = sorted_messages[-1]
+            last_message_id = last_message.get("id")
+            if last_message_id:
+                last_seen = last_message_id
+
+            if latest_job:
                 enqueue_success = await enqueue_job(latest_job)
                 if enqueue_success:
                     asyncio.create_task(post_job_non_blocking(latest_job))
