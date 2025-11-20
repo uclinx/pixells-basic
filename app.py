@@ -182,7 +182,7 @@ HMAC_SECRET_BYTES = HMAC_SECRET.encode()
 TIMESTAMP_HEADER = "X-TIMESTAMP"
 SIGNATURE_HEADER = "X-SIGNATURE"
 TIMESTAMP_TOLERANCE = int(setting("TIMESTAMP_TOLERANCE", "60"))
-RATE_LIMIT_PER_MINUTE = int(setting("RATE_LIMIT_PER_MINUTE", "40"))
+RATE_LIMIT_PER_MINUTE = int(setting("RATE_LIMIT_PER_MINUTE", "0"))
 RATE_LIMIT_WINDOW_SECONDS = int(setting("RATE_LIMIT_WINDOW_SECONDS", "60"))
 
 app = FastAPI(title="Roblox Job Gateway", docs_url=None, redoc_url=None)
@@ -229,6 +229,9 @@ def _client_identifier(request: Request) -> str:
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     if request.headers.get(INTERNAL_REQUEST_HEADER) == "1":
+        return await call_next(request)
+
+    if RATE_LIMIT_PER_MINUTE <= 0 or RATE_LIMIT_WINDOW_SECONDS <= 0:
         return await call_next(request)
 
     identifier = _client_identifier(request)
